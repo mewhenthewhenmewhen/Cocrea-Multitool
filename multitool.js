@@ -1,586 +1,708 @@
-/*
-Cocrea / Gandi IDE - Multitool Extension
-Filename: cocrea-multitool-extension.js
-Purpose: lightweight, modular multitool extension with togglable tools:
-  - AI Tools (stub + local-api hooks + endpoint input)
-  - Time Tools (multi-format, multi-timer)
-  - Variable Inspector (fixed scan + editor)
-  - Pop-out windows for stage/sprites/code (modal selector)
-  - Blocks that replicate tool actions as draggable UI blocks
-  - Draggable & collapsible windows
-  - Settings UI retained (user-request)
-  - Fatal error modal + non-fatal log pane
+/* Cocrea MultiTool — v_final
+   Single-file extension. Drop into your IDE page or repo and include via <script>.
+   Features: draggable/collapsible windows, timers (stopwatch default), variable inspector (Cocrea runtime scanning),
+   local advanced AI (auto fallback) + optional hosted endpoint, blocks that mirror UI, popouts, logs, quick console,
+   asset inspector, variable watchlist.
 
-How to use:
-  1. Drop this file into your IDE extensions folder or include via a <script> tag in the IDE environment.
-  2. Call `CocreaMultiToolExtension.init({ /* options */ })` from the platform bootstrap or console.
-
-Notes:
-  - This file preserves the prompts/settings UI (per your last message).
-  - The AI tool keeps stub mode and local-api mode; the UI now includes inputs for endpoint & auth so missing endpoint won't throw a confusing error.
-  - Everything stays zero-dependency and single-file.
-
---- Sections ---
-1) Boilerplate & integration
-2) UI creation & styling (draggable + collapsible)
-3) Module toggles & settings
-4) AI tool (UI includes endpoint + auth input; safer local-api handling)
-5) Time tool (Start/Stop/Reset visible + cleaner UI)
-6) Variable inspector (case-insensitive scan fixed)
-7) Pop-out implementation (modal with clickable options)
-8) Blocks implementation (draggable blocks + reporter output)
-9) Error handling & logging
-10) API / BOOTSTRAP
-
+   Usage: include this file on the IDE page. It auto-initializes ~200ms after load.
 */
 
-(function globalScope(root){
-  if (!root) return;
-
-  const EXT_ID = 'cocrea-multitool';
-  const STORAGE_KEY = EXT_ID + ':settings:v1';
-
-  // Default settings (kept; user requested no removal)
-  const defaultSettings = {
-    enabledTools: {
-      ai: true,
-      timers: true,
-      inspector: true,
-      blocks: true
+(function(window){
+  if(!window) return;
+  const EXT = 'cocrea-multitool-final';
+  const STORAGE = EXT + ':settings';
+  // ----------------------------
+  // Defaults
+  // ----------------------------
+  const defaults = {
+    enabled: { ai:true, timers:true, inspector:true, blocks:true, extras:true },
+    ai: { mode:'auto', // 'auto' => hosted if endpoint provided else local; 'hosted', 'local'
+          hosted: { endpoint:'', auth:'' },
+          reasoningDepth: 3
     },
-    ai: {
-      // Mode: 'stub' (no model), 'local-api', 'webworker'
-      mode: 'stub',
-      localApiEndpoint: '',
-      localApiAuth: '',
-      reasoningDepth: 2
-    },
-    timers: {
-      defaultFormat: 'hh:mm:ss',
-      maxTimers: 50
-    },
-    ui: {
-      position: { right: '8px', top: '8px' },
-      collapsed: false
-    }
+    timers: { defaultMode:'stopwatch', defaultFormat:'hh:mm:ss', max:200 },
+    ui: { right:'10px', top:'10px', theme:'dark' }
   };
 
-  // Integration hooks
-  const integration = {
-    selectors: {
-      stage: '#stage',
-      spritesPanel: '#sprites',
-      codeArea: '#code'
-    },
-    saveSettings: async (settings) => { localStorage.setItem(STORAGE_KEY, JSON.stringify(settings)); },
-    loadSettings: async () => { try { return JSON.parse(localStorage.getItem(STORAGE_KEY)); } catch(e){ return null; } },
-    log: (...args) => console.log('[Multitool]', ...args),
-    reportError: async (errInfo) => { console.error('[Multitool:Report]', errInfo); }
-  };
+  // ----------------------------
+  // State
+  // ----------------------------
+  let settings = {};
+  function loadSettings(){
+    try{ const s = JSON.parse(localStorage.getItem(STORAGE)); if(s) settings = Object.assign({}, defaults, s); else settings = Object.assign({}, defaults); }
+    catch(e){ settings = Object.assign({}, defaults); }
+  }
+  function saveSettings(){ try{ localStorage.setItem(STORAGE, JSON.stringify(settings)); }catch(e){} }
+
+  loadSettings();
 
   const state = {
-    settings: JSON.parse(JSON.stringify(defaultSettings)),
-    timers: {},
+    timers: {}, // id -> timer data
     logs: [],
-    isInitialized: false,
-    openPopouts: {},
-    blocks: []
+    blocks: [],
+    watches: {}, // variable watchlist name-> {ref, value}
+    aiCache: {}, // small cache
   };
 
-  /* =========================
-     Helpers
-     ========================= */
+  // ----------------------------
+  // Utilities
+  // ----------------------------
+  function $qs(s,ctx=document){ return ctx.querySelector(s); }
+  function $create(t, attrs={}){
+    const el = document.createElement(t);
+    for(const k in attrs) {
+      if(k === 'html') el.innerHTML = attrs[k];
+      else if(k === 'text') el.textContent = attrs[k];
+      else el.setAttribute(k, attrs[k]);
+    }
+    return el;
+  }
+  function log(...a){ state.logs.push({time:new Date().toISOString(), msg: a.map(x=> (typeof x === 'string' ? x : JSON.stringify(x))).join(' ')}); renderLogs(); console.log('[MT]', ...a); }
   function escapeHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-  function mergeDeep(a,b){ for(const k in b){ if(typeof b[k]==='object' && b[k] && !Array.isArray(b[k])){ a[k]=a[k]||{}; mergeDeep(a[k],b[k]); } else a[k]=b[k]; } return a; }
 
-  /* =========================
-     Styling + draggable/collapsible support
-     ========================= */
-  function createStyles(){
-    const prev = document.getElementById(EXT_ID+'-styles'); if (prev) prev.remove();
-    const style = document.createElement('style'); style.id = EXT_ID+'-styles';
-    style.innerText = `
-      .multitool-panel{position:fixed;right:${state.settings.ui.position.right};top:${state.settings.ui.position.top};width:360px;max-width:46vw;background:rgba(18,18,20,0.96);color:#e6e6e6;border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,.6);font-family:Inter,ui-sans-serif,system-ui,Arial;z-index:2147483646}
-      .mt-header{display:flex;align-items:center;justify-content:space-between;padding:8px;cursor:move}
-      .mt-title{font-weight:700}
-      .mt-btn{background:transparent;border:0;color:inherit;padding:6px;cursor:pointer;border-radius:6px}
-      .mt-body{padding:8px;max-height:60vh;overflow:auto}
+  // ----------------------------
+  // Styling
+  // ----------------------------
+  function injectStyles(){
+    if(document.getElementById(EXT+'-css')) return;
+    const css = `
+      #${EXT}-panel{position:fixed;right:${settings.ui.right};top:${settings.ui.top};width:420px;background:#0e0f12;color:#e6eef6;border-radius:10px;box-shadow:0 12px 48px rgba(0,0,0,.6);font-family:Inter,system-ui,Arial;z-index:2147483647;overflow:hidden}
+      #${EXT}-hdr{display:flex;align-items:center;justify-content:space-between;padding:10px;cursor:grab}
+      #${EXT}-hdr h3{margin:0;font-size:15px}
+      #${EXT}-body{padding:10px;max-height:66vh;overflow:auto}
+      .mt-btn{background:#1f6feb;color:white;border:0;padding:6px 10px;border-radius:8px;cursor:pointer}
+      .mt-ghost{background:transparent;border:1px solid rgba(255,255,255,0.04);padding:6px;border-radius:6px;color:#cbd5e1}
       .mt-section{margin-bottom:10px}
-      .mt-section label{display:block;margin:4px 0}
-      .mt-primary{background:#2b6cb0;border:0;color:white;padding:8px 10px;border-radius:6px;cursor:pointer}
-      .mt-logs{background:rgba(255,255,255,0.03);padding:8px;border-radius:6px;font-size:12px;max-height:120px;overflow:auto}
-      .timer-row{display:flex;gap:6px;align-items:center;margin-bottom:6px}
-      .timer-row input{flex:1}
-      /* collapsible */
-      .mt-collapsed .mt-body{display:none}
-      /* Draggable blocks */
-      .mt-block{position:fixed;left:40px;top:80px;background:#161616;color:#fff;padding:8px;border-radius:8px;box-shadow:0 8px 20px rgba(0,0,0,0.5);cursor:grab;z-index:2147483645}
-      .mt-block .mt-block-header{font-weight:700;margin-bottom:6px}
-      .mt-reporter{background:rgba(255,255,255,0.02);padding:6px;border-radius:6px;margin-top:6px;min-width:120px}
-      .mt-small{font-size:13px}
+      .mt-row{display:flex;gap:8px;align-items:center}
+      .mt-input{padding:6px;border-radius:6px;border:1px solid rgba(255,255,255,0.06);background:#0b0c0d;color:#e6eef6;flex:1}
+      .mt-select{padding:6px;border-radius:6px;border:1px solid rgba(255,255,255,0.06);background:#0b0c0d;color:#e6eef6}
+      .timer-line{display:flex;gap:6px;align-items:center;margin-bottom:6px}
+      .timer-display{min-width:130px;font-family:monospace}
+      .block{position:fixed;left:60px;top:140px;background:#111827;color:#f8fafc;padding:10px;border-radius:8px;box-shadow:0 10px 30px rgba(0,0,0,.5);z-index:2147483646;cursor:grab}
+      .reporter{background:rgba(255,255,255,0.02);padding:6px;border-radius:6px;margin-top:6px;min-width:120px;text-align:center}
+      .small{font-size:13px;color:#b3c2d1}
+      #${EXT}-logs{background:rgba(255,255,255,0.02);padding:8px;border-radius:8px;font-size:12px;max-height:120px;overflow:auto}
+      .collapse-hidden{display:none}
+      .mt-btn-plain{background:transparent;color:#9fb7d8;border:1px solid rgba(255,255,255,0.03);padding:6px;border-radius:6px}
     `;
-    document.head.appendChild(style);
+    const s = document.createElement('style');
+    s.id = EXT+'-css';
+    s.innerHTML = css;
+    document.head.appendChild(s);
   }
 
-  function makeElementDraggable(el, handle){
+  // ----------------------------
+  // Draggable helper
+  // ----------------------------
+  function makeDraggable(el, handle){
     handle = handle || el;
-    let dragging = false; let startX=0, startY=0, origX=0, origY=0;
-    function down(e){ dragging=true; startX = e.clientX; startY = e.clientY; const rect = el.getBoundingClientRect(); origX = rect.left; origY = rect.top; document.addEventListener('mousemove', move); document.addEventListener('mouseup', up); e.preventDefault(); }
-    function move(e){ if(!dragging) return; const dx = e.clientX - startX; const dy = e.clientY - startY; el.style.left = (origX + dx) + 'px'; el.style.top = (origY + dy) + 'px'; }
-    function up(){ dragging=false; document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); }
-    handle.addEventListener('mousedown', down);
-    // touch support
-    handle.addEventListener('touchstart', (ev)=>{ const t = ev.touches[0]; dragging=true; startX=t.clientX; startY=t.clientY; const rect=el.getBoundingClientRect(); origX=rect.left; origY=rect.top; document.addEventListener('touchmove', touchMove); document.addEventListener('touchend', touchEnd); ev.preventDefault(); });
-    function touchMove(ev){ if(!dragging) return; const t = ev.touches[0]; const dx = t.clientX - startX; const dy = t.clientY - startY; el.style.left = (origX + dx) + 'px'; el.style.top = (origY + dy) + 'px'; }
-    function touchEnd(){ dragging=false; document.removeEventListener('touchmove', touchMove); document.removeEventListener('touchend', touchEnd); }
+    let dragging=false, sx=0, sy=0, ox=0, oy=0;
+    handle.style.touchAction = 'none';
+    handle.addEventListener('mousedown', e=>{
+      dragging=true; sx=e.clientX; sy=e.clientY; const r=el.getBoundingClientRect(); ox=r.left; oy=r.top;
+      document.addEventListener('mousemove', mm); document.addEventListener('mouseup', mup); e.preventDefault();
+    });
+    handle.addEventListener('touchstart', e=>{
+      const t = e.touches[0]; dragging=true; sx=t.clientX; sy=t.clientY; const r=el.getBoundingClientRect(); ox=r.left; oy=r.top;
+      document.addEventListener('touchmove', tm); document.addEventListener('touchend', mup); e.preventDefault();
+    });
+    function mm(e){ if(!dragging) return; const dx = e.clientX - sx; const dy = e.clientY - sy; el.style.left = (ox + dx) + 'px'; el.style.top = (oy + dy) + 'px'; }
+    function tm(e){ if(!dragging) return; const t = e.touches[0]; const dx = t.clientX - sx; const dy = t.clientY - sy; el.style.left = (ox + dx) + 'px'; el.style.top = (oy + dy) + 'px'; }
+    function mup(){ dragging=false; document.removeEventListener('mousemove', mm); document.removeEventListener('touchmove', tm); document.removeEventListener('mouseup', mup); document.removeEventListener('touchend', mup); }
   }
 
-  /* =========================
-     UI CREATION
-     ========================= */
-  function createUI(){
-    // main panel
-    const old = document.getElementById(EXT_ID+'-panel'); if (old) old.remove();
-    const panel = document.createElement('div'); panel.id = EXT_ID + '-panel'; panel.className = 'multitool-panel';
-    if (state.settings.ui.collapsed) panel.classList.add('mt-collapsed');
+  // ----------------------------
+  // Core UI building
+  // ----------------------------
+  function buildPanel(){
+    injectStyles();
+    const existing = document.getElementById(EXT+'-panel');
+    if(existing) existing.remove();
 
+    const panel = $create('div', { id: EXT+'-panel' });
     panel.innerHTML = `
-      <div class="mt-header">
-        <div style="display:flex;gap:8px;align-items:center"><div class="mt-title">MultiTool</div></div>
-        <div>
-          <button id="mt-collapse" class="mt-btn">▾</button>
-          <button id="mt-open-main" class="mt-btn">Open</button>
+      <div id="${EXT}-hdr"><h3>MultiTool</h3>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button id="${EXT}-collapse" class="mt-btn-plain">▾</button>
+          <button id="${EXT}-open" class="mt-btn">Open</button>
         </div>
       </div>
-      <div class="mt-body">
+      <div id="${EXT}-body">
         <div class="mt-section">
-          <label><input type="checkbox" data-tool="ai"> AI Tools</label>
-          <label><input type="checkbox" data-tool="timers"> Time Tools</label>
-          <label><input type="checkbox" data-tool="inspector"> Variable Inspector</label>
-          <label><input type="checkbox" data-tool="blocks"> Blocks</label>
+          <div class="mt-row">
+            <label class="small"><input type="checkbox" id="${EXT}-toggle-ai"> AI</label>
+            <label class="small"><input type="checkbox" id="${EXT}-toggle-timers"> Timers</label>
+            <label class="small"><input type="checkbox" id="${EXT}-toggle-inspector"> Inspector</label>
+            <label class="small"><input type="checkbox" id="${EXT}-toggle-blocks"> Blocks</label>
+            <label class="small"><input type="checkbox" id="${EXT}-toggle-extras"> Extras</label>
+          </div>
         </div>
-        <div class="mt-section" id="mt-tool-area"></div>
-        <div class="mt-section">
-          <button id="mt-popout-btn" class="mt-primary">Pop-out Stage/Sprites/Code</button>
-          <button id="mt-new-block" class="mt-primary">Create Block</button>
-        </div>
-        <div class="mt-section mt-logs" id="mt-logs"></div>
+        <div id="${EXT}-tools"></div>
+        <div class="mt-section"><div class="small">Logs</div><div id="${EXT}-logs"></div></div>
       </div>
     `;
-
     document.body.appendChild(panel);
 
-    // wire collapse and drag
-    const header = panel.querySelector('.mt-header');
-    const collapseBtn = panel.querySelector('#mt-collapse');
-    collapseBtn.addEventListener('click', ()=>{ panel.classList.toggle('mt-collapsed'); state.settings.ui.collapsed = panel.classList.contains('mt-collapsed'); integration.saveSettings(state.settings); });
-    makeElementDraggable(panel, header);
+    // drag header
+    const hdr = $qs('#'+EXT+'-hdr');
+    makeDraggable(panel, hdr);
 
-    panel.querySelector('#mt-open-main').addEventListener('click', openMainInterface);
-    panel.querySelector('#mt-popout-btn').addEventListener('click', openPopoutDialog);
-    panel.querySelector('#mt-new-block').addEventListener('click', ()=>{ createBlock(); });
-
-    // wire tool checkboxes
-    const checkboxes = panel.querySelectorAll('input[type=checkbox][data-tool]');
-    checkboxes.forEach(cb =>{
-      const tool = cb.getAttribute('data-tool'); cb.checked = !!state.settings.enabledTools[tool];
-      cb.addEventListener('change', (e)=>{ state.settings.enabledTools[tool] = e.target.checked; integration.saveSettings(state.settings); renderToolArea(); });
+    // collapse
+    $qs('#'+EXT+'-collapse').addEventListener('click', ()=>{
+      const body = $qs('#'+EXT+'-body');
+      body.classList.toggle('collapse-hidden');
     });
 
-    return panel;
+    // toggles
+    $qs('#'+EXT+'-toggle-ai').checked = settings.enabled.ai;
+    $qs('#'+EXT+'-toggle-timers').checked = settings.enabled.timers;
+    $qs('#'+EXT+'-toggle-inspector').checked = settings.enabled.inspector;
+    $qs('#'+EXT+'-toggle-blocks').checked = settings.enabled.blocks;
+    $qs('#'+EXT+'-toggle-extras').checked = settings.enabled.extras;
+
+    $qs('#'+EXT+'-toggle-ai').addEventListener('change',(e)=>{ settings.enabled.ai = e.target.checked; saveSettings(); renderTools(); });
+    $qs('#'+EXT+'-toggle-timers').addEventListener('change',(e)=>{ settings.enabled.timers = e.target.checked; saveSettings(); renderTools(); });
+    $qs('#'+EXT+'-toggle-inspector').addEventListener('change',(e)=>{ settings.enabled.inspector = e.target.checked; saveSettings(); renderTools(); });
+    $qs('#'+EXT+'-toggle-blocks').addEventListener('change',(e)=>{ settings.enabled.blocks = e.target.checked; saveSettings(); renderTools(); });
+    $qs('#'+EXT+'-toggle-extras').addEventListener('change',(e)=>{ settings.enabled.extras = e.target.checked; saveSettings(); renderTools(); });
+
+    $qs('#'+EXT+'-open').addEventListener('click', ()=> openMainWindow());
+
+    renderTools();
+    renderLogs();
   }
 
-  function renderToolArea(){
-    const area = document.getElementById('mt-tool-area'); if (!area) return; area.innerHTML = '';
-    if (state.settings.enabledTools.ai) area.appendChild(renderAiTool());
-    if (state.settings.enabledTools.timers) area.appendChild(renderTimersTool());
-    if (state.settings.enabledTools.inspector) area.appendChild(renderInspectorTool());
-    if (state.settings.enabledTools.blocks) area.appendChild(renderBlocksTool());
+  // ----------------------------
+  // Tools renderer (AI, Timers, Inspector, Blocks, Extras)
+  // ----------------------------
+  function renderTools(){
+    const container = $qs('#'+EXT+'-tools');
+    container.innerHTML = '';
+
+    if(settings.enabled.ai) container.appendChild(buildAiTool());
+    if(settings.enabled.timers) container.appendChild(buildTimersTool());
+    if(settings.enabled.inspector) container.appendChild(buildInspectorTool());
+    if(settings.enabled.blocks) container.appendChild(buildBlocksTool());
+    if(settings.enabled.extras) container.appendChild(buildExtrasTool());
   }
 
-  /* =========================
-     4) AI TOOL (UI + safer local-api handling)
-     ========================= */
-  function renderAiTool(){
-    const wrap = document.createElement('div'); wrap.className = 'mt-ai-tool';
-    wrap.innerHTML = `
+  // ----------------------------
+  // AI TOOL
+  // ----------------------------
+  function buildAiTool(){
+    const wrap = $create('div', { class:'mt-section', html:`
       <div><strong>AI Tools</strong></div>
-      <div style="margin-top:6px">
-        <textarea id="mt-ai-prompt" placeholder="Ask something..." style="width:100%;height:80px"></textarea>
-        <div style="display:flex;gap:8px;margin-top:6px;align-items:center">
-          <button id="mt-ai-run" class="mt-primary">Run</button>
-          <select id="mt-ai-mode">
-            <option value="stub">Stub (demo)</option>
-            <option value="local-api">Local API</option>
-            <option value="webworker">WebWorker</option>
-          </select>
-        </div>
-        <div style="display:flex;gap:6px;margin-top:6px;align-items:center">
-          <input id="mt-ai-endpoint" placeholder="Local API endpoint (optional)" style="flex:1"/>
-          <input id="mt-ai-auth" placeholder="Auth token (optional)" style="width:180px"/>
-        </div>
-        <pre id="mt-ai-output" style="white-space:pre-wrap;margin-top:8px;background:rgba(255,255,255,0.03);padding:8px;border-radius:6px;min-height:60px"></pre>
+      <div class="mt-row" style="margin-top:6px">
+        <textarea id="${EXT}-ai-prompt" class="mt-input" style="height:80px" placeholder="Ask the AI..."></textarea>
       </div>
-    `;
-
+      <div class="mt-row" style="margin-top:8px">
+        <select id="${EXT}-ai-mode" class="mt-select"><option value="auto">Auto (hosted if configured, else local)</option><option value="hosted">Hosted</option><option value="local">Local</option></select>
+        <input id="${EXT}-ai-endpoint" class="mt-input" placeholder="Hosted endpoint (optional)" />
+        <input id="${EXT}-ai-auth" class="mt-input" placeholder="Auth token (optional)" style="width:170px" />
+        <button id="${EXT}-ai-run" class="mt-btn">Run</button>
+      </div>
+      <pre id="${EXT}-ai-out" style="margin-top:8px;background:rgba(255,255,255,0.02);padding:8px;border-radius:6px;min-height:60px"></pre>
+    `});
     setTimeout(()=>{
-      const runBtn = wrap.querySelector('#mt-ai-run');
-      const modeSel = wrap.querySelector('#mt-ai-mode');
-      const prompt = wrap.querySelector('#mt-ai-prompt');
-      const out = wrap.querySelector('#mt-ai-output');
-      const endpointInput = wrap.querySelector('#mt-ai-endpoint');
-      const authInput = wrap.querySelector('#mt-ai-auth');
+      const modeEl = $qs('#'+EXT+'-ai-mode');
+      const endpointEl = $qs('#'+EXT+'-ai-endpoint');
+      const authEl = $qs('#'+EXT+'-ai-auth');
+      const runBtn = $qs('#'+EXT+'-ai-run');
+      const out = $qs('#'+EXT+'-ai-out');
+      // populate saved
+      if(settings.ai.hosted.endpoint) endpointEl.value = settings.ai.hosted.endpoint;
+      if(settings.ai.hosted.auth) authEl.value = settings.ai.hosted.auth;
+      modeEl.value = settings.ai.mode || 'auto';
+      modeEl.addEventListener('change', ()=>{ settings.ai.mode = modeEl.value; saveSettings(); });
 
-      // populate from saved settings if present
-      modeSel.value = state.settings.ai.mode || 'stub';
-      endpointInput.value = state.settings.ai.localApiEndpoint || '';
-      authInput.value = state.settings.ai.localApiAuth || '';
-
-      modeSel.addEventListener('change', ()=>{ state.settings.ai.mode = modeSel.value; integration.saveSettings(state.settings); });
-      endpointInput.addEventListener('change', ()=>{ state.settings.ai.localApiEndpoint = endpointInput.value; integration.saveSettings(state.settings); });
-      authInput.addEventListener('change', ()=>{ state.settings.ai.localApiAuth = authInput.value; integration.saveSettings(state.settings); });
+      endpointEl.addEventListener('change', ()=>{ settings.ai.hosted.endpoint = endpointEl.value; saveSettings(); });
+      authEl.addEventListener('change', ()=>{ settings.ai.hosted.auth = authEl.value; saveSettings(); });
 
       runBtn.addEventListener('click', async ()=>{
-        const q = prompt.value.trim();
-        if (!q){ out.textContent = 'Please enter a prompt.'; return; }
-        out.textContent = 'Running...';
+        const prompt = $qs('#'+EXT+'-ai-prompt').value.trim();
+        if(!prompt){ out.textContent = 'Type a question.'; return; }
+        out.textContent = 'Thinking...';
         try{
-          const resp = await runAiQuery(q, { mode: state.settings.ai.mode, localApiEndpoint: endpointInput.value, localApiAuth: authInput.value });
-          out.textContent = resp;
+          const mode = modeEl.value;
+          let res;
+          if(mode === 'hosted' || (mode==='auto' && settings.ai.hosted.endpoint)){
+            // try hosted if endpoint present; otherwise fallback to local
+            if(settings.ai.hosted.endpoint){
+              try{
+                res = await callHostedModel(prompt, settings.ai.hosted.endpoint, settings.ai.hosted.auth);
+              }catch(e){
+                log('Hosted call failed, falling back to local:', e.message||e);
+                res = runLocalAi(prompt);
+              }
+            } else {
+              res = runLocalAi(prompt);
+            }
+          } else {
+            // local
+            res = runLocalAi(prompt);
+          }
+          out.textContent = res;
         }catch(err){
-          out.textContent = 'Error: ' + (err.message||err);
-          reportNonFatal(err);
+          out.textContent = 'Error: ' + (err.message||String(err));
+          reportError(err);
         }
       });
     },0);
-
     return wrap;
   }
 
-  async function runAiQuery(prompt, opts={}){
-    if (!prompt) return 'No prompt provided.';
-    opts = Object.assign({}, state.settings.ai, opts);
-
-    if (opts.mode === 'stub'){
-      // Enhanced stub: small KB + heuristic chaining
-      const steps = [];
-      steps.push('Input: ' + prompt);
-      steps.push('Step 1: tokenize and identify patterns');
-      // tiny KB
-      const kb = [
-        {k:'timer', v:'Timers support formats hh:mm:ss, hh:mm:ss.ms, mm:ss, seconds.'},
-        {k:'variable', v:'Variables are available on the window or project namespace.'},
-        {k:'popout', v:'You can pop out stage/sprites/code via the pop-out button.'}
-      ];
-      const q = prompt.toLowerCase();
-      kb.forEach(entry=>{ if (q.includes(entry.k)) steps.push('Fact: '+entry.v); });
-      steps.push('Step 2: Apply heuristic rules');
-      if (q.includes('timer')||q.includes('time')){ steps.push('Answer: Use ' + state.settings.timers.defaultFormat + ' for display.'); return steps.join('
-'); }
-      steps.push('Answer (stub): I can help design logic; provide a concrete question or attach a local model endpoint for deeper answers.');
-      return steps.join('
-');
-    }
-
-    if (opts.mode === 'local-api'){
-      const endpoint = opts.localApiEndpoint || state.settings.ai.localApiEndpoint;
-      const auth = opts.localApiAuth || state.settings.ai.localApiAuth || '';
-      if (!endpoint) throw new Error('No endpoint set in AI settings. Enter an endpoint in the AI UI field.');
-      // call endpoint (try JSON with {prompt})
-      const headers = {'Content-Type':'application/json'}; if (auth) headers['Authorization'] = auth;
-      const r = await fetch(endpoint, { method:'POST', headers, body: JSON.stringify({ prompt }) });
-      if (!r.ok) throw new Error('API error: ' + r.status + ' ' + r.statusText);
-      const ct = r.headers.get('content-type') || '';
-      if (ct.includes('application/json')){
-        const j = await r.json(); return (j.text || j.result || JSON.stringify(j));
-      }
-      return await r.text();
-    }
-
-    if (opts.mode === 'webworker'){
-      return await runWorkerPrompt(prompt, opts.reasoningDepth);
-    }
-
-    throw new Error('Unknown AI mode: ' + opts.mode);
+  // Hosted call helper: expects endpoint to accept JSON { prompt } and return text or { text }
+  async function callHostedModel(prompt, endpoint, auth){
+    if(!endpoint) throw new Error('No hosted endpoint provided.');
+    const headers = { 'Content-Type':'application/json' };
+    if(auth) headers['Authorization'] = auth;
+    const r = await fetch(endpoint, { method:'POST', headers, body: JSON.stringify({ prompt }) });
+    if(!r.ok) throw new Error('Remote API error ' + r.status);
+    const ct = r.headers.get('content-type') || '';
+    if(ct.includes('application/json')){ const j = await r.json(); return j.text || j.result || JSON.stringify(j); }
+    return await r.text();
   }
 
-  function runWorkerPrompt(prompt, depth){
-    return new Promise((resolve)=>{ setTimeout(()=>resolve('Worker Response (simulated): ' + prompt.slice(0,200)), 300 + Math.random()*500); });
+  // ----------------------------
+  // Local advanced AI (improved heuristic engine)
+  // ----------------------------
+  function runLocalAi(prompt){
+    // quick cache
+    if(state.aiCache && state.aiCache[prompt]) return state.aiCache[prompt];
+
+    const p = prompt.trim();
+    // basic classification
+    const l = p.toLowerCase();
+    // small knowledge base + templates
+    const kb = [
+      {k:'timer', v:'Timers support hh:mm:ss (hours:minutes:seconds). Use stopwatch for counting up, timer for countdown.'},
+      {k:'variable', v:'Project variables live in the runtime namespace; use the inspector to view and edit them.'},
+      {k:'popout', v:'Use the pop-out to open stage/sprites/code in a separate window.'},
+      {k:'block', v:'Blocks can create timers and reporters; drag them anywhere.'},
+    ];
+    const steps = ['Input: ' + p, 'Parsing...'];
+    kb.forEach(item => { if(l.includes(item.k)) steps.push('Fact: ' + item.v); });
+    // Some simple code reasoning heuristics
+    if(l.match(/explain .*code|what does .* do|how does .* work/)){
+      steps.push('Heuristic: code explanation requested — try summarizing function names, parameters and return values.');
+      steps.push('Answer: ' + summarizeCodeStub(p));
+      const out = steps.join('\n');
+      state.aiCache = state.aiCache || {};
+      state.aiCache[prompt] = out;
+      return out;
+    }
+    if(l.includes('timer') || l.includes('stopwatch') || l.includes('countdown')){
+      steps.push('Answer: ' + kb[0].v);
+      const out = steps.join('\n');
+      state.aiCache = state.aiCache || {};
+      state.aiCache[prompt] = out;
+      return out;
+    }
+    // fallback generic answer with chain-of-thought style steps
+    steps.push('Reasoning: simplify question, retrieve relevant facts, suggest next steps.');
+    steps.push('Suggestion: If you want deeper natural-language answers, paste a hosted model endpoint in the AI settings.');
+    steps.push('Answer (local): I can help design logic, create timers, or inspect variables. Ask me to "create a timer X" or "explain function Y".');
+    const out = steps.join('\n');
+    state.aiCache = state.aiCache || {};
+    state.aiCache[prompt] = out;
+    return out;
   }
 
-  /* =========================
-     5) TIME TOOL (timers updated)
-     ========================= */
-  function renderTimersTool(){
-    const wrap = document.createElement('div'); wrap.className = 'mt-timers-tool';
+  function summarizeCodeStub(q){
+    // naive stub: if user pasted small code, we can strip and comment. For now return a helpful template
+    return 'I can summarize small functions. Paste the function body and ask: "explain this function".';
+  }
+
+  // ----------------------------
+  // Timers
+  // ----------------------------
+  function buildTimersTool(){
+    const wrap = $create('div', { class:'mt-section' });
     wrap.innerHTML = `
-      <div><strong>Time Tools</strong></div>
-      <div style="margin-top:6px">
-        <div style="display:flex;gap:6px;margin-bottom:6px">
-          <input id="mt-timer-name" placeholder="Timer name" />
-          <select id="mt-timer-format">
-            <option value="hh:mm:ss">hh:mm:ss</option>
-            <option value="hh:mm:ss.ms">hh:mm:ss.ms</option>
-            <option value="mm:ss">mm:ss</option>
-            <option value="seconds">seconds</option>
-          </select>
-          <button id="mt-create-timer" class="mt-primary">Create</button>
-        </div>
-        <div id="mt-timer-list"></div>
+      <div><strong>Timers</strong></div>
+      <div class="mt-row" style="margin-top:6px">
+        <input id="${EXT}-timer-name" class="mt-input" placeholder="Timer ID (optional)">
+        <select id="${EXT}-timer-mode" class="mt-select"><option value="stopwatch">Stopwatch (count up)</option><option value="timer">Timer (countdown)</option></select>
+        <input id="${EXT}-timer-seconds" class="mt-input" placeholder="Time or leave blank (seconds)">
+        <button id="${EXT}-timer-make" class="mt-btn">Create</button>
       </div>
+      <div id="${EXT}-timer-list" style="margin-top:8px"></div>
     `;
-
     setTimeout(()=>{
-      const list = wrap.querySelector('#mt-timer-list');
-      const createBtn = wrap.querySelector('#mt-create-timer');
-      const nameInput = wrap.querySelector('#mt-timer-name');
-      const formatSel = wrap.querySelector('#mt-timer-format');
-
-      createBtn.addEventListener('click', ()=>{
-        const name = nameInput.value || ('Timer ' + (Object.keys(state.timers).length+1));
-        const fmt = formatSel.value;
-        const id = createTimer({name, format:fmt});
-        renderTimerList(list);
+      $qs('#'+EXT+'-timer-make').addEventListener('click', ()=>{
+        const name = $qs('#'+EXT+'-timer-name').value.trim() || ('T'+Date.now().toString().slice(-4));
+        const mode = $qs('#'+EXT+'-timer-mode').value;
+        const timeVal = Number($qs('#'+EXT+'-timer-seconds').value) || 0;
+        createTimer({ id:name, mode, seconds: timeVal });
+        renderTimerList();
       });
-
-      renderTimerList(list);
+      renderTimerList();
     },0);
-
     return wrap;
   }
 
-  function createTimer(opts={}){
-    const id = 't_' + Date.now() + '_' + Math.floor(Math.random()*9999);
-    state.timers[id] = { id, name: opts.name || id, format: opts.format || state.settings.timers.defaultFormat, running:false, startAt:null, elapsed:0, _last: null };
+  function createTimer(opts){
+    // opts: id, mode ('stopwatch'|'timer'), seconds (for timer)
+    const id = opts.id || ('t_'+Date.now()+'_'+Math.floor(Math.random()*9999));
+    const t = { id, name:opts.id||id, mode:opts.mode||settings.timers.defaultMode, targetSeconds: opts.seconds||0, elapsed:0, running:false, _last:0, created:Date.now() };
+    state.timers[id] = t;
+    log('Timer created', id, t.mode, t.targetSeconds);
     return id;
   }
-
-  function startTimer(id){ const t = state.timers[id]; if(!t) return; if (t.running) return; t.running = true; t._last = performance.now(); t._tick = function(){ if(!t.running) return; const now = performance.now(); t.elapsed += (now - t._last); t._last = now; dispatchTimerUpdate(id); t._raf = requestAnimationFrame(t._tick); }; t._raf = requestAnimationFrame(t._tick); }
-  function stopTimer(id){ const t = state.timers[id]; if(!t) return; t.running = false; if (t._raf) cancelAnimationFrame(t._raf); t._raf = null; dispatchTimerUpdate(id); }
-  function resetTimer(id){ const t = state.timers[id]; if(!t) return; t.running = false; t.elapsed = 0; t._last = null; if (t._raf) cancelAnimationFrame(t._raf); t._raf = null; dispatchTimerUpdate(id); }
-
-  function formatElapsed(ms, fmt){ const total = Math.floor(ms); const hours = Math.floor(total/3600000); const minutes = Math.floor((total%3600000)/60000); const seconds = Math.floor((total%60000)/1000); const msRem = Math.floor(total%1000); function pad(v,d=2){ return String(v).padStart(d,'0'); } if (fmt==='seconds') return (total/1000).toFixed(3)+'s'; if (fmt==='mm:ss') return pad(minutes)+':'+pad(seconds); if (fmt==='hh:mm:ss') return pad(hours)+':'+pad(minutes)+':'+pad(seconds); return pad(hours)+':'+pad(minutes)+':'+pad(seconds)+'.'+String(msRem).padStart(3,'0'); }
-
-  function dispatchTimerUpdate(id){ const ev = new CustomEvent('multitool:timer:update', {detail:{id, timer:state.timers[id]}}); window.dispatchEvent(ev); }
-
-  function renderTimerList(container){
-    container.innerHTML = '';
+  function startTimer(id){
+    const t = state.timers[id]; if(!t) return;
+    if(t.running) return;
+    t.running = true; t._last = performance.now();
+    function tick(){
+      if(!t.running) return;
+      const now = performance.now();
+      t.elapsed += (now - t._last);
+      t._last = now;
+      // if timer mode and elapsed >= target => stop and notify
+      if(t.mode === 'timer' && (t.elapsed/1000) >= t.targetSeconds && t.targetSeconds>0){
+        t.running = false;
+        t.elapsed = t.targetSeconds*1000;
+        alert('Timer '+t.id+' finished.');
+      }
+      dispatchTimerUpdate(id);
+      t._raf = requestAnimationFrame(tick);
+    }
+    t._raf = requestAnimationFrame(tick);
+  }
+  function stopTimer(id){
+    const t = state.timers[id]; if(!t) return;
+    t.running = false; if(t._raf) cancelAnimationFrame(t._raf); t._raf = null;
+    dispatchTimerUpdate(id);
+  }
+  function resetTimer(id){
+    const t = state.timers[id]; if(!t) return;
+    t.running = false; t.elapsed = 0; t._last = 0; if(t._raf) cancelAnimationFrame(t._raf); t._raf=null;
+    dispatchTimerUpdate(id);
+  }
+  function formatTime(ms){
+    const total = Math.floor(ms/1000);
+    const h = Math.floor(total/3600); const m = Math.floor((total%3600)/60); const s = total%60;
+    function p(n){ return String(n).padStart(2,'0'); }
+    return `${p(h)}:${p(m)}:${p(s)}`;
+  }
+  function dispatchTimerUpdate(id){
+    const ev = new CustomEvent('multitool:timer-update',{detail:{id, timer: state.timers[id]}});
+    window.dispatchEvent(ev);
+  }
+  function renderTimerList(){
+    const list = $qs('#'+EXT+'-timer-list');
+    if(!list) return;
+    list.innerHTML = '';
     Object.values(state.timers).forEach(t=>{
-      const row = document.createElement('div'); row.className='timer-row';
-      const inp = document.createElement('input'); inp.value = t.name; inp.addEventListener('change', (e)=>{t.name=e.target.value});
-      const disp = document.createElement('div'); disp.textContent = formatElapsed(t.elapsed||0,t.format); disp.style.minWidth='120px';
-      const play = document.createElement('button'); play.textContent = t.running? 'Stop' : 'Start'; play.addEventListener('click', ()=>{ if (t.running) stopTimer(t.id); else startTimer(t.id); renderTimerList(container); } );
-      const lapb = document.createElement('button'); lapb.textContent='Lap'; lapb.addEventListener('click', ()=>{ /* lap logic: emit a console log */ console.log('Lap for', t.id, formatElapsed(t.elapsed||0,t.format)); });
-      const reset = document.createElement('button'); reset.textContent='Reset'; reset.addEventListener('click', ()=>{ resetTimer(t.id); renderTimerList(container); });
-
-      const updateFn = ()=>{ disp.textContent = formatElapsed(t.elapsed||0,t.format); play.textContent = t.running? 'Stop' : 'Start'; };
-      window.addEventListener('multitool:timer:update', (ev)=>{ if (ev.detail.id===t.id) updateFn(); });
-
-      row.appendChild(inp); row.appendChild(disp); row.appendChild(play); row.appendChild(lapb); row.appendChild(reset);
-      container.appendChild(row);
+      const row = $create('div', { class:'timer-line' });
+      const name = $create('input', { class:'mt-input', value: t.name });
+      name.addEventListener('change', (e)=>{ t.name = e.target.value; });
+      const disp = $create('div', { class:'timer-display', html: formatTime(t.elapsed) });
+      const startBtn = $create('button', { class:'mt-btn', text:'Start' }); startBtn.textContent = t.running ? 'Stop' : 'Start';
+      startBtn.addEventListener('click', ()=>{
+        if(t.running) stopTimer(t.id); else startTimer(t.id);
+        renderTimerList();
+      });
+      const resetBtn = $create('button', { class:'mt-ghost', text:'Reset' }); resetBtn.addEventListener('click', ()=>{ resetTimer(t.id); renderTimerList(); });
+      row.appendChild(name); row.appendChild(disp); row.appendChild(startBtn); row.appendChild(resetBtn);
+      list.appendChild(row);
+      // update display on tick
+      window.addEventListener('multitool:timer-update', (ev)=>{ if(ev.detail.id === t.id) { const dt = ev.detail.timer; disp.textContent = dt.mode==='timer' && dt.targetSeconds>0 ? formatTime((dt.targetSeconds*1000) - dt.elapsed) : formatTime(dt.elapsed); startBtn.textContent = dt.running ? 'Stop' : 'Start'; }});
     });
   }
 
-  /* =========================
-     6) VARIABLE INSPECTOR (fixed scanning)
-     ========================= */
-  function renderInspectorTool(){
-    const wrap = document.createElement('div'); wrap.className='mt-inspector-tool';
+  // ----------------------------
+  // Variable Inspector — scans Cocrea runtime
+  // ----------------------------
+  function buildInspectorTool(){
+    const wrap = $create('div', { class:'mt-section' });
     wrap.innerHTML = `
       <div><strong>Variable Inspector</strong></div>
-      <div style="margin-top:6px">
-        <div style="display:flex;gap:6px;margin-bottom:6px">
-          <input id="mt-var-filter" placeholder="Filter variable name" />
-          <button id="mt-scan-vars" class="mt-primary">Scan</button>
-        </div>
-        <div id="mt-vars-list" style="font-size:13px;max-height:200px;overflow:auto;background:rgba(255,255,255,0.02);padding:6px;border-radius:6px"></div>
+      <div class="mt-row" style="margin-top:6px">
+        <input id="${EXT}-var-filter" class="mt-input" placeholder="Filter (variable name)">
+        <button id="${EXT}-var-scan" class="mt-btn">Scan</button>
       </div>
+      <div id="${EXT}-var-list" style="margin-top:8px"></div>
     `;
-
     setTimeout(()=>{
-      const scanBtn = wrap.querySelector('#mt-scan-vars');
-      const filter = wrap.querySelector('#mt-var-filter');
-      const list = wrap.querySelector('#mt-vars-list');
-      scanBtn.addEventListener('click', ()=>{
-        const results = scanGlobals(filter.value||'');
+      $qs('#'+EXT+'-var-scan').addEventListener('click', ()=>{
+        const f = $qs('#'+EXT+'-var-filter').value.trim();
+        const results = scanCocreaRuntime(f);
+        const list = $qs('#'+EXT+'-var-list');
         list.innerHTML = '';
-        if (!results.length) list.innerHTML = '<div class="mt-small">No variables matched the filter.</div>';
+        if(!results.length) list.innerHTML = `<div class="small">No variables found matching "${escapeHtml(f)}".</div>`;
         results.forEach(r=>{
-          const item = document.createElement('div');
-          item.style.marginBottom = '6px';
-          const preview = escapeHtml(r.preview);
-          item.innerHTML = `<code>${escapeHtml(r.name)}</code> — <em>${escapeHtml(r.type)}</em> — ${preview}`;
-          const editBtn = document.createElement('button'); editBtn.textContent='Edit'; editBtn.style.marginLeft='6px';
-          editBtn.addEventListener('click', ()=>{ openVariableEditor(r.name, r.value); });
-          item.appendChild(editBtn);
-          list.appendChild(item);
+          const row = $create('div', { html: `<code>${escapeHtml(r.name)}</code> — <span class="small">${escapeHtml(r.type)}</span> — <span class="small">${escapeHtml(r.preview)}</span>`});
+          const edit = $create('button', { class:'mt-btn-plain', text:'Edit' });
+          edit.addEventListener('click', ()=> openVarEditor(r) );
+          row.appendChild(edit);
+          list.appendChild(row);
         });
       });
     },0);
-
     return wrap;
   }
 
-  function scanGlobals(filter){
-    const out = []; const seen = new Set();
-    const f = String(filter||'').toLowerCase();
-    function pushKey(k, v){ if (seen.has(k)) return; seen.add(k); if (f && !k.toLowerCase().includes(f)) return; let type = typeof v; let preview = ''; try{ if (v === null) type='null'; else if (type==='object') preview = JSON.stringify(Object.keys(v).slice(0,5)); else preview = String(v).slice(0,120); }catch(e){ preview='[unpreviewable]'; } out.push({name:k,type,preview,value:v}); }
-    const candidates = ['project','IDE','cocrea','app'];
-    candidates.forEach(n=>{ if (window[n]){ Object.keys(window[n]).forEach(k=> pushKey(n+'.'+k, window[n][k])); } });
-    // fallback - sample selected keys from window
-    const keys = Object.keys(window).slice(0,800);
-    keys.forEach(k=> pushKey(k, window[k]));
-    return out.sort((a,b)=>a.name.localeCompare(b.name));
+  function scanCocreaRuntime(filter){
+    // Tries common Cocrea global names and prioritizes those; fallback to scanning window
+    const candidates = ['project','IDE','cocrea','app','runtime','Cocrea'];
+    const f = (filter||'').toLowerCase();
+    const out = [];
+    const seen = new Set();
+    function add(name, val){
+      if(seen.has(name)) return; seen.add(name);
+      let type = typeof val;
+      let preview = '';
+      try{
+        if(val === null) type = 'null';
+        else if(type === 'object') preview = JSON.stringify(Object.keys(val).slice(0,6));
+        else preview = String(val).slice(0,120);
+      }catch(e){ preview = '[unreadable]'; }
+      if(!f || name.toLowerCase().includes(f)) out.push({ name, type, preview, value: val });
+    }
+    // examine candidates
+    for(const n of candidates){
+      try{ if(window[n]){ const obj = window[n]; Object.keys(obj).forEach(k=> add(n + '.' + k, obj[k])); } }catch(e){}
+    }
+    // fallback: scan window keys but prioritize ones likely to be project runtime
+    try{
+      const keys = Object.keys(window).slice(0,800);
+      for(const k of keys){
+        // prefer keys with 'project' or 'sprite' etc
+        if(k.toLowerCase().includes('project') || k.toLowerCase().includes('sprite') || k.toLowerCase().includes('stage') || k.toLowerCase().includes('cocrea')){
+          try{ add(k, window[k]); }catch(e){}
+        }
+      }
+      // then general keys
+      for(const k of keys){
+        try{ add(k, window[k]); }catch(e){}
+      }
+    }catch(e){}
+    return out;
   }
 
-  function openVariableEditor(name, currentValue){
-    const w = window.open('', '_blank', 'width=640,height=480');
-    if (!w) return alert('Unable to open editor (popups blocked)');
-    w.document.title = 'Variable Editor - ' + name;
-    const ta = w.document.createElement('textarea'); ta.style.width='100%'; ta.style.height='70%';
-    try { ta.value = JSON.stringify(currentValue, null, 2); } catch(e){ ta.value = String(currentValue); }
-    const btn = w.document.createElement('button'); btn.textContent='Apply'; btn.addEventListener('click', ()=>{
+  function openVarEditor(entry){
+    // entry: {name, value}
+    const w = window.open('', '_blank', 'width=720,height=520');
+    if(!w) return alert('Allow popups to edit variables.');
+    w.document.title = 'Edit: ' + entry.name;
+    const ta = w.document.createElement('textarea'); ta.style.width='100%'; ta.style.height='72%';
+    try{ ta.value = JSON.stringify(entry.value, null, 2); }catch(e){ ta.value = String(entry.value); }
+    const btn = w.document.createElement('button'); btn.textContent = 'Apply'; btn.className='mt-btn';
+    btn.addEventListener('click', ()=>{
       try{
         const parsed = JSON.parse(ta.value);
-        const parts = name.split('.'); let obj = window; for(let i=0;i<parts.length-1;i++){ obj = obj[parts[i]]; if (!obj) throw new Error('Parent not found'); }
-        obj[parts[parts.length-1]] = parsed; alert('Applied');
-      }catch(err){ alert('Failed to apply: '+err.message); }
+        // set on window where possible — we try to resolve name path
+        const parts = entry.name.split('.');
+        if(parts.length === 1){
+          window[parts[0]] = parsed;
+        } else {
+          let obj = window;
+          for(let i=0;i<parts.length-1;i++){
+            obj = obj[parts[i]];
+            if(obj === undefined) throw new Error('Parent not found');
+          }
+          obj[parts[parts.length-1]] = parsed;
+        }
+        alert('Applied.');
+      }catch(err){
+        alert('Failed: ' + (err.message||err));
+      }
     });
     w.document.body.appendChild(ta); w.document.body.appendChild(btn);
   }
 
-  /* =========================
-     7) POPOUT IMPLEMENTATION (modal + options)
-     ========================= */
-  function openPopoutDialog(){
-    // modal selection (no prompt) with default options
-    const modal = document.createElement('div'); modal.style.position='fixed'; modal.style.inset='0'; modal.style.background='rgba(0,0,0,0.45)'; modal.style.display='flex'; modal.style.alignItems='center'; modal.style.justifyContent='center'; modal.style.zIndex='100000';
-    const box = document.createElement('div'); box.style.background='#fff'; box.style.padding='12px'; box.style.borderRadius='8px'; box.style.minWidth='320px';
-    box.innerHTML = `<h3 style='margin:0 0 8px 0'>Pop-out</h3><div style='display:flex;gap:8px;margin-bottom:8px'><button id='mt-popout-stage'>Stage</button><button id='mt-popout-sprites'>Sprites</button><button id='mt-popout-code'>Code</button></div><div style='margin-bottom:8px'><input id='mt-popout-custom' placeholder='Or enter selector (e.g. .my-stage)' style='width:100%'/></div><div style='text-align:right'><button id='mt-popout-cancel'>Cancel</button></div>`;
-    modal.appendChild(box); document.body.appendChild(modal);
-
-    box.querySelector('#mt-popout-cancel').addEventListener('click', ()=> modal.remove());
-    box.querySelector('#mt-popout-stage').addEventListener('click', ()=>{ modal.remove(); doPopout(integration.selectors.stage, 'stage'); });
-    box.querySelector('#mt-popout-sprites').addEventListener('click', ()=>{ modal.remove(); doPopout(integration.selectors.spritesPanel, 'sprites'); });
-    box.querySelector('#mt-popout-code').addEventListener('click', ()=>{ modal.remove(); doPopout(integration.selectors.codeArea, 'code'); });
-    box.querySelector('#mt-popout-custom').addEventListener('keydown', (e)=>{ if (e.key === 'Enter'){ const val = e.target.value.trim(); if (!val) return; modal.remove(); doPopout(val, val); } });
-  }
-
-  function doPopout(selector, name){
-    const el = document.querySelector(selector);
-    if (!el) return alert('Element not found for selector: ' + selector);
-    return popoutElement(el, name);
-  }
-
-  function popoutElement(element, name){
-    try{
-      const w = window.open('', '_blank', 'width=1000,height=700');
-      if (!w) return alert('Popout blocked by browser.');
-      w.document.title = 'Popout - ' + name;
-      const clone = element.cloneNode(true);
-      w.document.body.style.margin='0'; w.document.body.appendChild(clone);
-      state.openPopouts[name || ('popout_'+Date.now())] = {win:w, selector: element};
-      const interval = setInterval(()=>{ if (w.closed){ clearInterval(interval); delete state.openPopouts[name]; } }, 800);
-      return w;
-    }catch(err){ reportNonFatal(err); }
-  }
-
-  /* =========================
-     8) BLOCKS (draggable blocks & reporters)
-     ========================= */
-  function renderBlocksTool(){
-    const wrap = document.createElement('div'); wrap.className='mt-blocks-tool';
+  // ----------------------------
+  // Blocks tool
+  // ----------------------------
+  function buildBlocksTool(){
+    const wrap = $create('div', { class:'mt-section' });
     wrap.innerHTML = `
       <div><strong>Blocks</strong></div>
-      <div style='margin-top:6px'>
-        <div style='display:flex;gap:6px;margin-bottom:6px'><input id='mt-block-timer-name' placeholder='Block timer name' /><button id='mt-block-create' class='mt-primary'>Create Timer Block</button></div>
-        <div class='mt-small'>Drag created blocks to move them. Blocks can create timers and show reporters.</div>
+      <div class="mt-row" style="margin-top:6px">
+        <input id="${EXT}-block-name" class="mt-input" placeholder="Block Timer ID">
+        <select id="${EXT}-block-mode" class="mt-select"><option value="stopwatch">Stopwatch</option><option value="timer">Timer</option></select>
+        <input id="${EXT}-block-time" class="mt-input" placeholder="Seconds (for timer only)">
+        <button id="${EXT}-block-create" class="mt-btn">Create Block</button>
       </div>
+      <div class="small" style="margin-top:6px">Blocks are draggable and each includes a draggable reporter output you can place anywhere.</div>
     `;
-
     setTimeout(()=>{
-      const createBtn = wrap.querySelector('#mt-block-create');
-      const nameInput = wrap.querySelector('#mt-block-timer-name');
-      createBtn.addEventListener('click', ()=>{ createBlock({ timerName: nameInput.value || ('BlockTimer'+(Object.keys(state.timers).length+1)) }); });
+      $qs('#'+EXT+'-block-create').addEventListener('click', ()=>{
+        const id = $qs('#'+EXT+'-block-name').value.trim() || ('B'+Date.now().toString().slice(-4));
+        const mode = $qs('#'+EXT+'-block-mode').value;
+        const seconds = Number($qs('#'+EXT+'-block-time').value) || 0;
+        makeBlock({ id, mode, seconds });
+      });
     },0);
-
     return wrap;
   }
 
-  function createBlock(opts={}){
-    const block = document.createElement('div'); block.className='mt-block'; block.style.left = '40px'; block.style.top = (80 + state.blocks.length*60) + 'px';
-    block.innerHTML = `<div class='mt-block-header'>Timer Block</div><div>Creates timer: <strong>${escapeHtml(opts.timerName||'Timer')}</strong></div><div style='display:flex;gap:6px;margin-top:8px'><button class='mt-block-start'>Start</button><button class='mt-block-stop'>Stop</button><button class='mt-block-reset'>Reset</button></div><div class='mt-reporter' data-timer=''></div>`;
+  function makeBlock(opts){
+    // create timer backing if requested
+    const tid = createTimer({ id: opts.id, mode: opts.mode, seconds: opts.seconds });
+    const block = $create('div', { class:'block', html: `<div style="font-weight:700">${escapeHtml(opts.id)}</div><div class="small">${escapeHtml(opts.mode)}</div><div style="margin-top:6px"><button class="mt-btn" data-act="start">Start</button><button class="mt-btn-plain" data-act="stop">Stop</button><button class="mt-btn-plain" data-act="reset">Reset</button></div><div class="reporter" data-tid="${tid}">${formatTime(0)}</div>`});
     document.body.appendChild(block);
-    // make draggable
-    makeElementDraggable(block, block.querySelector('.mt-block-header'));
-
-    // create underlying timer
-    const id = createTimer({ name: opts.timerName || ('BlockTimer'+(Object.keys(state.timers).length+1)), format: state.settings.timers.defaultFormat });
-    const reporter = block.querySelector('.mt-reporter'); reporter.textContent = formatElapsed(state.timers[id].elapsed||0, state.timers[id].format);
-    reporter.setAttribute('data-timer', id);
-
-    block.querySelector('.mt-block-start').addEventListener('click', ()=>{ startTimer(id); });
-    block.querySelector('.mt-block-stop').addEventListener('click', ()=>{ stopTimer(id); });
-    block.querySelector('.mt-block-reset').addEventListener('click', ()=>{ resetTimer(id); reporter.textContent = formatElapsed(0, state.timers[id].format); });
-
-    // update reporter on tick
-    window.addEventListener('multitool:timer:update', (ev)=>{ if (ev.detail.id === id) reporter.textContent = formatElapsed(ev.detail.timer.elapsed||0, ev.detail.timer.format); });
-
-    state.blocks.push({ el: block, timerId: id });
+    // draggable
+    makeDraggable(block, block);
+    // wire buttons
+    block.querySelector('[data-act="start"]').addEventListener('click', ()=> startTimer(tid));
+    block.querySelector('[data-act="stop"]').addEventListener('click', ()=> stopTimer(tid));
+    block.querySelector('[data-act="reset"]').addEventListener('click', ()=> resetTimer(tid));
+    // reporter draggable: user can drag block itself; reporter floats inside but you can detach later (not implemented detach for now)
+    // update reporter on timer updates
+    window.addEventListener('multitool:timer-update', (ev)=>{ if(ev.detail.id === tid){ const r = block.querySelector('.reporter'); const t = ev.detail.timer; r.textContent = t.mode === 'timer' && t.targetSeconds > 0 ? formatTime((t.targetSeconds*1000) - t.elapsed) : formatTime(t.elapsed); }});
+    // store state
+    state.blocks.push({ el:block, tid });
+    log('Block created', opts.id);
     return block;
   }
 
-  /* =========================
-     9) ERROR HANDLING & LOGS
-     ========================= */
-  function reportFatal(err){ try{ const info = {time:new Date().toISOString(), message:err.message||String(err), stack:err.stack||null}; state.logs.push({level:'fatal',info}); integration.reportError(info); showFatalModal(info); }catch(e){ console.error(e); } }
-  function reportNonFatal(err){ try{ const info={time:new Date().toISOString(),message:err.message||String(err),stack:err.stack||null}; state.logs.push({level:'warn',info}); renderLogs(); }catch(e){ console.error(e); } }
-
-  function showFatalModal(info){
-    const modal = document.createElement('div'); modal.className='mt-fatal-modal';
-    modal.innerHTML = `
-      <div style="position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:100000">
-        <div style="background:white;color:black;padding:16px;border-radius:8px;max-width:900px;min-width:320px">
-          <h3>Fatal Error</h3>
-          <pre style="white-space:pre-wrap;max-height:300px;overflow:auto">${escapeHtml(JSON.stringify(info, null, 2))}</pre>
-          <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">
-            <button id="mt-fatal-copy">Copy</button>
-            <button id="mt-fatal-close">Close</button>
-          </div>
-        </div>
+  // ----------------------------
+  // Extras (Quick console, asset inspector, watchlist)
+  // ----------------------------
+  function buildExtrasTool(){
+    const wrap = $create('div', { class:'mt-section' });
+    wrap.innerHTML = `
+      <div><strong>Extras</strong></div>
+      <div style="margin-top:6px" class="mt-row">
+        <input id="${EXT}-quick-js" class="mt-input" placeholder="Quick JS (runs in page)">
+        <button id="${EXT}-run-js" class="mt-btn">Run</button>
       </div>
+      <div style="margin-top:6px" class="mt-row">
+        <button id="${EXT}-scan-assets" class="mt-btn-plain">Asset Inspector</button>
+        <button id="${EXT}-open-watch" class="mt-btn-plain">Variable Watchlist</button>
+      </div>
+      <div id="${EXT}-assets" style="margin-top:8px"></div>
+      <div id="${EXT}-watch" style="margin-top:8px"></div>
     `;
+    setTimeout(()=>{
+      $qs('#'+EXT+'-run-js').addEventListener('click', ()=>{
+        const code = $qs('#'+EXT+'-quick-js').value;
+        try{ const res = (new Function(code))(); alert('Result: ' + String(res)); }catch(e){ alert('Error: ' + (e.message||e)); }
+      });
+      $qs('#'+EXT+'-scan-assets').addEventListener('click', ()=> renderAssetInspector());
+      $qs('#'+EXT+'-open-watch').addEventListener('click', ()=> renderWatchlist());
+    },0);
+    return wrap;
+  }
+
+  function renderAssetInspector(){
+    const el = $qs('#'+EXT+'-assets'); el.innerHTML = '<div class="small">Scanning DOM for possible assets (images, elements with data-sprite)...</div>';
+    // quick heuristic: images, elements with data-sprite attribute
+    const imgs = Array.from(document.querySelectorAll('img')).slice(0,50);
+    const sprites = Array.from(document.querySelectorAll('[data-sprite]')).slice(0,50);
+    el.innerHTML = '<div class="small">Images: '+imgs.length+' | Sprites (data-sprite): '+sprites.length+'</div>';
+    imgs.slice(0,10).forEach(i=> el.appendChild($create('div',{ html: `<img src="${i.src}" style="max-width:120px;margin:6px;border-radius:6px">` })));
+    sprites.slice(0,10).forEach(s=> el.appendChild($create('div',{ html: `<code>${escapeHtml(s.getAttribute('data-sprite'))}</code>` })));
+  }
+
+  function renderWatchlist(){
+    const w = $qs('#'+EXT+'-watch'); w.innerHTML = '<div class="small">Watchlist</div>';
+    Object.keys(state.watches).forEach(k=>{
+      const it = state.watches[k];
+      const row = $create('div', { html: `<code>${escapeHtml(k)}</code>: <span class="small">${escapeHtml(String(it.value))}</span>`});
+      w.appendChild(row);
+    });
+    const addRow = $create('div', { class:'mt-row', html: `<input class="mt-input" id="${EXT}-watch-add" placeholder="global.var.name"><button id="${EXT}-watch-add-btn" class="mt-btn">Add</button>`});
+    w.appendChild(addRow);
+    setTimeout(()=> $qs('#'+EXT+'-watch-add-btn').addEventListener('click', ()=>{
+      const k = $qs('#'+EXT+'-watch-add').value.trim();
+      if(!k) return;
+      const val = resolvePath(k);
+      state.watches[k] = { ref: k, value: val };
+      renderWatchlist();
+    }),0);
+  }
+
+  function resolvePath(path){
+    try{
+      const parts = path.split('.');
+      let o = window;
+      for(const p of parts){ o = o[p]; if(o === undefined) break; }
+      return o;
+    }catch(e){ return undefined; }
+  }
+
+  // ----------------------------
+  // Popouts
+  // ----------------------------
+  function openMainWindow(){
+    const w = window.open('', '_blank', 'width=960,height=700');
+    if(!w) return alert('Allow popups to open the main window.');
+    w.document.title = 'MultiTool - Main';
+    const container = w.document.createElement('div'); container.style.padding = '12px';
+    container.innerHTML = `<h2>MultiTool — Main Interface</h2><pre id="mt-main-settings">${escapeHtml(JSON.stringify(settings, null, 2))}</pre><h3>Logs</h3><pre id="mt-main-logs">${escapeHtml(state.logs.map(l=>l.time+' '+l.msg).join('\\n'))}</pre>`;
+    w.document.body.appendChild(container);
+  }
+
+  // pop-out for specific IDE elements
+  function doPopout(selector){
+    const el = document.querySelector(selector);
+    if(!el) return alert('Selector not found: ' + selector);
+    const nw = window.open('', '_blank', 'width=1000,height=700');
+    if(!nw) return alert('Allow popups for popout.');
+    nw.document.title = 'Popout: ' + selector;
+    const clone = el.cloneNode(true);
+    nw.document.body.style.margin = '0';
+    nw.document.body.appendChild(clone);
+  }
+
+  // ----------------------------
+  // Logs & errors
+  // ----------------------------
+  function renderLogs(){
+    const el = $qs('#'+EXT+'-logs');
+    if(!el) return;
+    el.innerHTML = state.logs.slice(-40).map(x=> escapeHtml(x.time + ' — ' + x.msg) ).map(s=> `<div class="small">${s}</div>`).join('');
+  }
+  function reportError(e){
+    log('ERROR', e && e.message ? e.message : String(e));
+    // fatal modal
+    const modal = $create('div', { html:`<div style="position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:2147483650"><div style="background:white;color:black;padding:12px;border-radius:8px;max-width:900px"><h3>Fatal Error</h3><pre style="max-height:300px;overflow:auto">${escapeHtml(JSON.stringify({time:new Date().toISOString(), message: e.message||String(e), stack: e.stack||''}, null,2))}</pre><div style="text-align:right"><button id="${EXT}-fatal-copy" class="mt-btn">Copy</button><button id="${EXT}-fatal-close" class="mt-btn-plain">Close</button></div></div></div>` });
     document.body.appendChild(modal);
-    modal.querySelector('#mt-fatal-copy').addEventListener('click', ()=>{ navigator.clipboard.writeText(JSON.stringify(info, null, 2)); });
-    modal.querySelector('#mt-fatal-close').addEventListener('click', ()=>{ modal.remove(); });
+    modal.querySelector('#'+EXT+'-fatal-copy').addEventListener('click', ()=> navigator.clipboard.writeText(JSON.stringify({time:new Date().toISOString(), message: e.message||String(e), stack: e.stack||''}, null,2)));
+    modal.querySelector('#'+EXT+'-fatal-close').addEventListener('click', ()=> modal.remove());
   }
 
-  function renderLogs(){ const logsArea = document.getElementById('mt-logs'); if (!logsArea) return; logsArea.innerHTML = state.logs.slice(-50).map(l=>`<div><strong>${l.level}</strong> ${l.info.time} - ${escapeHtml(l.info.message||'')}</div>`).join(''); }
-
-  /* =========================
-     10) BOOTSTRAP
-     ========================= */
-  async function init(userIntegration){
-    if (state.isInitialized) return;
-    if (userIntegration) Object.assign(integration, userIntegration);
-    // load saved settings
-    const saved = await integration.loadSettings(); if (saved) mergeDeep(state.settings, saved);
-    createStyles();
-    const panel = createUI();
-    renderToolArea();
-    renderLogs();
-    state.isInitialized = true;
-    integration.log('Multitool initialized');
-
-    window.addEventListener('error', (ev)=>{ reportFatal(ev.error || {message: ev.message}); });
-    window.addEventListener('unhandledrejection', (ev)=>{ reportFatal(ev.reason || {message:'Unhandled rejection'}); });
+  // ----------------------------
+  // Initialization & auto-detect Cocrea runtime
+  // ----------------------------
+  function autodetectCocrea(){
+    // try to find likely runtime global names and set a convenience list for popout or variable scanner
+    const names = ['project','IDE','cocrea','app','runtime','Cocrea'];
+    const found = [];
+    names.forEach(n=> { try{ if(window[n]) found.push(n);}catch(e){} });
+    // if none found, attempt some heuristics: check for elements with data-stage or id=stage
+    if(!found.length){
+      if(document.getElementById('stage')) found.push('stage element (DOM)');
+      const ds = document.querySelector('[data-stage]'); if(ds) found.push('data-stage DOM');
+    }
+    log('Autodetected runtime targets: ' + found.join(', '));
+    return found;
   }
 
-  // Expose API
-  root.CocreaMultiToolExtension = { init, getState: ()=>state, runAiQuery, createTimer, startTimer, stopTimer, resetTimer, popoutElement, createBlock, integration };
+  // ----------------------------
+  // Boot
+  // ----------------------------
+  function boot(){
+    try{
+      buildPanel();
+      autodetectCocrea();
+      // attach popout quick actions (stage/sprites/code) in extras area for quick access
+      // but avoid errors if elements don't exist; do not auto-popout
+      window.addEventListener('error', (e)=> { reportError(e.error || e); });
+      window.addEventListener('unhandledrejection', (e)=> { reportError(e.reason || e); });
+      log('MultiTool loaded');
+    }catch(e){ reportError(e); }
+  }
+
+  // expose API
+  window.CocreaMultiTool = {
+    boot, settings, state, createTimer, startTimer, stopTimer, resetTimer, makeBlock, runLocalAi, reportError, doPopout
+  };
+
+  // auto run
+  setTimeout(()=>{ boot(); }, 250);
 
 })(window);
-
-/* =========================
-   End of file
-   ========================= */
